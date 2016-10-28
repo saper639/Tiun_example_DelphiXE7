@@ -1,0 +1,202 @@
+unit Unit2;
+
+interface
+uses
+  System.SysUtils, System.Classes, IdBaseComponent, IdComponent, IdTCPConnection, IdTCPClient,
+  IniFiles, Forms, Vcl.ExtCtrls, IdGlobal, Superobject, DateUtils;
+
+type TReadArr = array of string;
+
+type TManager = class(TObject)
+private
+   TextEncode: IIdTextEncoding;
+   procedure TCPClientDisconnected(Sender: TObject);
+public
+   TCPClient : TIdTCPClient;
+
+   constructor Create;
+   function    ConnectToPhone(Host: string; Port: word): boolean;
+   procedure   DisconnectFromPhone;
+   function    SendToPhone(TX: string): string;
+   procedure   OnLinkError;
+   function    DecodeAnswer(RX: string): byte;
+   function    ReadClientBuf: TReadArr;
+   procedure   CreateTCPClient;
+   procedure   WorkSMSJSON(JSON: ISuperObject);
+   function    UnixDateToString(USec: Int64): string;
+end;
+
+var
+
+
+   Manager : TManager;
+
+implementation
+
+uses Unit1;
+
+constructor TManager.Create;
+begin
+   TextEncode := IndyTextEncoding_UTF8;
+   TCPClient := nil;
+end;
+
+function TManager.ConnectToPhone(Host: string; Port: word): boolean;
+begin
+   Result := True;
+   LogOut('Try connect to the phone');
+   if TCPClient = nil then CreateTCPClient;
+   TCPClient.Host := Host;
+   TCPClient.Port := Port;
+   try
+      TCPClient.Connect;
+      LogOut('Successful connection to the phone: ' + TCPClient.Host + ':' + IntToStr(TCPClient.Port));
+      Form1.SetControlsStatus(True);
+      TCPClient.IOHandler.WriteLn('1234', TextEncode);  //send password to the phone
+   except
+      LogOut('Error connecting to the phone: ' + TCPClient.Host + ':' + IntToStr(TCPClient.Port));
+      Result := False;
+   end;
+end;
+
+procedure TManager.DisconnectFromPhone;
+begin
+   TCPClient.Disconnect;
+   Form1.SetControlsStatus(False);
+   LogOut('Disconnecting from the phone');
+end;
+
+procedure TManager.CreateTCPClient;
+begin
+   TCPClient := TIdTCPClient.Create();
+   TCPClient.ConnectTimeout := 2000;
+   TCPClient.ReadTimeout := 1000;
+   TCPClient.OnDisconnected := TCPClientDisconnected;
+end;
+
+procedure TManager.OnLinkError;
+begin
+   Form1.SetControlsStatus(False);
+   TCPClient.Destroy;
+   TCPClient := nil;
+   CreateTCPClient;
+end;
+
+function TManager.SendToPhone(TX: string): string;
+var RX, Res: string; JSON: ISuperObject; i, PartCount: word;
+begin
+   LogOut('TX = ' + TX);
+   if TcpClient = nil then Exit;
+   TCPClient.CheckForGracefulDisconnect(False);
+   TCPClient.IOHandler.CheckForDisconnect(False);
+   if not TCPClient.Connected then
+   begin
+      LogOut('Connection fail');
+      OnLinkError;
+      Exit;
+   end;
+
+   try
+      TCPClient.IOHandler.InputBuffer.Clear;
+      TCPClient.IOHandler.WriteLn(TX, TextEncode);
+      RX := TCPClient.IOHandler.ReadLn(TextEncode);
+      LogOut('RX = ' + RX);
+      DecodeAnswer(RX);
+   except
+      LogOut('Transmission error on the phone' + TX);
+      OnLinkError;
+      Exit;
+   end;
+end;
+
+procedure TManager.WorkSMSJSON(JSON: ISuperObject);
+var i: integer; AddJSON: ISuperObject; USec: int64;
+begin
+   for i := 0 to JSON.AsArray.Length - 1 do
+   begin
+      AddJSON := JSON.AsArray.O[i];
+      LogOut('Phone = ' + AddJSON.S[KeyAdres]);
+      LogOut('SMS = ' + AddJSON.S[KeyBody]);
+      LogOut('ID = ' + IntToStr(AddJSON.I[KeyID]));
+      USec := AddJSON.I[KeyDate];
+      LogOut('Date = ' + UnixDateToString(Trunc(USec/1000)));
+   end;
+end;
+
+function TManager.DecodeAnswer(RX: string): byte;
+var JSON, ArrJSON, ArrJSON2, AddJSON, AddJSON1, AddJSON2: ISuperObject; Cmd:string; Arg:word;
+    i,j : integer;
+begin
+   Result := 0;
+   try
+      JSON := SO(RX);
+   except
+      Result := 1;
+      LogOut('Package structure error');
+      Exit;
+   end;
+   Cmd := JSON.S[KeyCmd];
+   Arg := JSON.I[KeyArg];
+   if (Cmd = CmdGetSMSLast) or (Cmd = CmdGetSMS) then
+   begin
+      AddJSON := JSON.O[KeyAnswer];
+      ArrJSON := AddJSON.O[KeySMS];
+      if not ArrJSON.IsType(stArray)  then Exit;
+      WorkSMSJSON(ArrJSON);
+   end
+   else if Cmd = CmdGetCmdList then
+   begin
+      ArrJSON := JSON.O[KeyAnswer];
+      if not ArrJSON.IsType(stArray)  then Exit;
+
+      for i := 0 to ArrJSON.AsArray.Length - 1 do
+      begin
+         AddJSON1 := ArrJSON.AsArray.O[i];
+         LogOut(AddJSON1.S[KeyCommand] + ' -> ' + AddJSON1.S[Keydescription]);
+      end;
+   end
+   else if Cmd = CmdGetContact then
+   begin
+      AddJSON := JSON.O[KeyAnswer];
+      ArrJSON := AddJSON.O[KeyContacts];
+      if ArrJSON.IsType(stArray) then
+      begin
+         for i := 0 to ArrJSON.AsArray.Length - 1 do
+         begin
+            AddJSON1 := ArrJSON.AsArray.O[i];
+            LogOut('Account = ' + AddJSON1.S['display_name']);
+            ArrJSON2 := AddJSON1.O[KeyPhones];
+            if not ArrJSON2.IsType(stArray) then Exit;
+            for j := 0 to ArrJSON2.AsArray.Length - 1 do
+            begin
+               AddJSON2 := ArrJSON2.AsArray.O[j];
+               LogOut('    Phone = ' + AddJSON2.S['data1']);
+            end;
+         end;
+      end;
+   end;
+end;
+
+function TManager.UnixDateToString(USec: Int64): string;
+begin
+  Result := DateTimeToStr(UnixToDateTime(USec));
+end;
+
+procedure TManager.TCPClientDisconnected(Sender: TObject);
+begin
+   LogOut('Disconnected');
+end;
+
+function TManager.ReadClientBuf: TReadArr;
+var L: integer;
+begin
+   SetLength(Result, 0);
+   while not TCPClient.Socket.InputBufferIsEmpty do
+   begin
+      L := Length(Result);
+      SetLength(Result, L + 1);
+      Result[L] := TCPClient.Socket.ReadLn(TextEncode);
+   end;
+end;
+
+end.
